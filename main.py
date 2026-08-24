@@ -10,17 +10,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = os.getenv("OWNER_ID")
+OPERATOR_IDS_STR = os.getenv("OPERATOR_IDS", "")
 
 if not TOKEN:
     raise ValueError("BOT_TOKEN не задан в переменных окружения!")
-if not OWNER_ID:
-    raise ValueError("OWNER_ID не задан в переменных окружения!")
 
+# Преобразуем строку с ID в список целых чисел
 try:
-    OWNER_ID = int(OWNER_ID)
+    OPERATOR_IDS = [int(x.strip()) for x in OPERATOR_IDS_STR.split(",") if x.strip()]
 except ValueError:
-    raise ValueError("OWNER_ID должен быть целым числом")
+    raise ValueError("OPERATOR_IDS должен содержать целые числа, разделённые запятыми")
+
+if not OPERATOR_IDS:
+    raise ValueError("OPERATOR_IDS не может быть пустым! Укажите хотя бы один ID.")
 
 # ---- Логирование ----
 logging.basicConfig(
@@ -29,54 +31,56 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---- Вспомогательная функция для безопасного форматирования ----
+# ---- Вспомогательная функция для безопасного форматирования (HTML) ----
 def format_sender_info_html(user):
-    """Возвращает HTML-строку с информацией об отправителе (все данные экранированы)."""
     safe_name = html.escape(user.full_name or "Без имени")
     safe_username = f"@{html.escape(user.username)}" if user.username else "нет username"
     return f"👤 От: {safe_name} (ID: <code>{user.id}</code>, {safe_username})"
 
-# ---- Обработчик сообщений ----
+# ---- Обработчик всех сообщений от пользователей ----
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
     if not message or not user:
         return
-    if user.id == OWNER_ID:   # не пересылаем сообщения от самого владельца
+
+    # Если сообщение от оператора – не пересылаем (чтобы не зациклить)
+    if user.id in OPERATOR_IDS:
         return
 
     sender_info = format_sender_info_html(user)
 
     try:
-        if message.text:
-            # Экранируем текст сообщения
-            safe_text = html.escape(message.text)
-            full_text = f"{sender_info}\n\n📝 Сообщение:\n{safe_text}"
-            await context.bot.send_message(
-                chat_id=OWNER_ID,
-                text=full_text,
-                parse_mode=ParseMode.HTML
-            )
-        elif message.photo or message.video or message.document or message.audio or message.voice:
-            # Формируем подпись с экранированием
-            caption = f"{sender_info}\n\n📎 Медиа-сообщение"
-            if message.caption:
-                safe_caption = html.escape(message.caption)
-                caption += f"\n\n📝 Текст: {safe_caption}"
-            await message.copy(
-                chat_id=OWNER_ID,
-                caption=caption,
-                parse_mode=ParseMode.HTML
-            )
-        else:
-            # Прочие типы (стикеры, контакты, локации)
-            await message.copy(chat_id=OWNER_ID)
-            await context.bot.send_message(
-                chat_id=OWNER_ID,
-                text=sender_info,
-                parse_mode=ParseMode.HTML
-            )
+        # Пересылаем каждому оператору
+        for operator_id in OPERATOR_IDS:
+            if message.text:
+                safe_text = html.escape(message.text)
+                full_text = f"{sender_info}\n\n📝 Сообщение:\n{safe_text}"
+                await context.bot.send_message(
+                    chat_id=operator_id,
+                    text=full_text,
+                    parse_mode=ParseMode.HTML
+                )
+            elif message.photo or message.video or message.document or message.audio or message.voice:
+                caption = f"{sender_info}\n\n📎 Медиа-сообщение"
+                if message.caption:
+                    safe_caption = html.escape(message.caption)
+                    caption += f"\n\n📝 Текст: {safe_caption}"
+                await message.copy(
+                    chat_id=operator_id,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                # Стикеры, контакты, локации и т.п.
+                await message.copy(chat_id=operator_id)
+                await context.bot.send_message(
+                    chat_id=operator_id,
+                    text=sender_info,
+                    parse_mode=ParseMode.HTML
+                )
 
+        # Подтверждение пользователю
         await message.reply_text("✅ Ваше сообщение передано в поддержку.")
     except Exception as e:
         logger.error(f"Ошибка при пересылке: {e}")
@@ -86,7 +90,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я бот поддержки.\n"
-        "Отправьте любое сообщение, и я передам его оператору.\n\n",
+        "Отправьте любое сообщение, и я передам его операторам.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -98,18 +102,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help  – справка\n\n"
         "👤 Для пользователей:\n"
         "Просто отправьте сообщение.\n\n"
-        "🛠 Для оператора:\n"
+        "🛠 Для операторов:\n"
         "/reply <user_id> <текст> – ответить пользователю.\n"
         "Пример: `/reply 123456789 Привет!`",
         parse_mode=ParseMode.MARKDOWN
     )
 
-# ---- Команда /reply (только для владельца) ----
+# ---- Команда /reply (только для операторов) ----
 async def reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != OWNER_ID:
+    if user.id not in OPERATOR_IDS:
         await update.message.reply_text("⛔ Нет прав.")
         return
+
     args = context.args
     if len(args) < 2:
         await update.message.reply_text(
@@ -117,12 +122,15 @@ async def reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN
         )
         return
+
     try:
         target_user_id = int(args[0])
     except ValueError:
         await update.message.reply_text("❌ user_id должен быть числом.")
         return
+
     reply_text = " ".join(args[1:])
+
     try:
         await context.bot.send_message(
             chat_id=target_user_id,
@@ -136,14 +144,38 @@ async def reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка при отправке ответа: {e}")
         await update.message.reply_text(f"❌ Не удалось отправить. Ошибка: {e}")
 
+# ---- Команда /operators (показывает список операторов, только для них же) ----
+async def list_operators(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in OPERATOR_IDS:
+        await update.message.reply_text("⛔ Нет прав.")
+        return
+    # Получаем имена операторов (через getChat)
+    names = []
+    for op_id in OPERATOR_IDS:
+        try:
+            chat = await context.bot.get_chat(op_id)
+            name = chat.full_name or str(op_id)
+        except:
+            name = str(op_id)
+        names.append(f"• {name} (ID: `{op_id}`)")
+    await update.message.reply_text(
+        "👥 Список операторов:\n" + "\n".join(names),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
 # ---- Запуск ----
 def main():
     app = Application.builder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("reply", reply_to_user))
+    app.add_handler(CommandHandler("operators", list_operators))  # опционально
+
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
-    logger.info("🚀 Бот запущен...")
+
+    logger.info(f"🚀 Бот запущен. Операторы: {OPERATOR_IDS}")
     app.run_polling()
 
 if __name__ == "__main__":
