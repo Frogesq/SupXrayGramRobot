@@ -76,9 +76,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---- Команды ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привет! Я бот поддержки.\n"
-        "Отправьте любое сообщение, и я передам его оператору.\n\n"
-        "Оператор может ответить командой `/reply`.",
+        "👋 Привет! Я бот поддержки XrayGram.\n"
+        "Отправьте любое сообщение, и я передам его оператору.\n\n",
         parse_mode=ParseMode.MARKDOWN
     )
 
