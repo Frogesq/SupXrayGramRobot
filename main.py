@@ -1,12 +1,13 @@
 import os
 import logging
+import html
 from telegram import Update
-from telegram.constants import ParseMode          # <-- ПРАВИЛЬНЫЙ импорт
+from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
 
-# ---- Загрузка переменных окружения (если есть файл .env) ----
-load_dotenv()   # Можно удалить, если вы уверены, что переменные заданы через панель
+# ---- Загрузка переменных окружения ----
+load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = os.getenv("OWNER_ID")
@@ -28,11 +29,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---- Вспомогательные функции ----
-def format_sender_info(user):
-    name = user.full_name or "Без имени"
-    username = f"@{user.username}" if user.username else "нет username"
-    return f"👤 От: {name} (ID: `{user.id}`, {username})"
+# ---- Вспомогательная функция для безопасного форматирования ----
+def format_sender_info_html(user):
+    """Возвращает HTML-строку с информацией об отправителе (все данные экранированы)."""
+    safe_name = html.escape(user.full_name or "Без имени")
+    safe_username = f"@{html.escape(user.username)}" if user.username else "нет username"
+    return f"👤 От: {safe_name} (ID: <code>{user.id}</code>, {safe_username})"
 
 # ---- Обработчик сообщений ----
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -43,44 +45,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id == OWNER_ID:   # не пересылаем сообщения от самого владельца
         return
 
-    sender_info = format_sender_info(user)
+    sender_info = format_sender_info_html(user)
+
     try:
         if message.text:
-            full_text = f"{sender_info}\n\n📝 Сообщение:\n{message.text}"
+            # Экранируем текст сообщения
+            safe_text = html.escape(message.text)
+            full_text = f"{sender_info}\n\n📝 Сообщение:\n{safe_text}"
             await context.bot.send_message(
                 chat_id=OWNER_ID,
                 text=full_text,
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=ParseMode.HTML
             )
         elif message.photo or message.video or message.document or message.audio or message.voice:
+            # Формируем подпись с экранированием
             caption = f"{sender_info}\n\n📎 Медиа-сообщение"
             if message.caption:
-                caption += f"\n\n📝 Текст: {message.caption}"
+                safe_caption = html.escape(message.caption)
+                caption += f"\n\n📝 Текст: {safe_caption}"
             await message.copy(
                 chat_id=OWNER_ID,
                 caption=caption,
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=ParseMode.HTML
             )
         else:
+            # Прочие типы (стикеры, контакты, локации)
             await message.copy(chat_id=OWNER_ID)
             await context.bot.send_message(
                 chat_id=OWNER_ID,
                 text=sender_info,
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=ParseMode.HTML
             )
+
         await message.reply_text("✅ Ваше сообщение передано в поддержку.")
     except Exception as e:
         logger.error(f"Ошибка при пересылке: {e}")
         await message.reply_text("❌ Не удалось отправить. Попробуйте позже.")
 
-# ---- Команды ----
+# ---- Команда /start ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привет! Я бот поддержки XrayGram.\n"
+        "👋 Привет! Я бот поддержки.\n"
         "Отправьте любое сообщение, и я передам его оператору.\n\n",
         parse_mode=ParseMode.MARKDOWN
     )
 
+# ---- Команда /help ----
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 Доступные команды:\n"
@@ -94,6 +104,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN
     )
 
+# ---- Команда /reply (только для владельца) ----
 async def reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id != OWNER_ID:
