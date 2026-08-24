@@ -11,18 +11,32 @@ load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
 OPERATOR_IDS_STR = os.getenv("OPERATOR_IDS", "")
+OWNER_ID_STR = os.getenv("OWNER_ID", "")
 
 if not TOKEN:
     raise ValueError("BOT_TOKEN не задан в переменных окружения!")
 
-# Преобразуем строку с ID в список целых чисел
-try:
-    OPERATOR_IDS = [int(x.strip()) for x in OPERATOR_IDS_STR.split(",") if x.strip()]
-except ValueError:
-    raise ValueError("OPERATOR_IDS должен содержать целые числа, разделённые запятыми")
+# ---- Определяем список операторов ----
+OPERATOR_IDS = []
 
+# Сначала пытаемся прочитать OPERATOR_IDS (список через запятую)
+if OPERATOR_IDS_STR.strip():
+    try:
+        OPERATOR_IDS = [int(x.strip()) for x in OPERATOR_IDS_STR.split(",") if x.strip()]
+    except ValueError:
+        raise ValueError("OPERATOR_IDS должен содержать целые числа, разделённые запятыми")
+
+# Если OPERATOR_IDS пуст, пробуем использовать OWNER_ID (один оператор)
+if not OPERATOR_IDS and OWNER_ID_STR.strip():
+    try:
+        OPERATOR_IDS = [int(OWNER_ID_STR.strip())]
+        print("⚠️ Используется OWNER_ID как единственный оператор. Рекомендуется перейти на OPERATOR_IDS.")
+    except ValueError:
+        raise ValueError("OWNER_ID должен быть целым числом")
+
+# Если всё равно пусто – ошибка
 if not OPERATOR_IDS:
-    raise ValueError("OPERATOR_IDS не может быть пустым! Укажите хотя бы один ID.")
+    raise ValueError("Не задан ни OPERATOR_IDS, ни OWNER_ID. Укажите хотя бы одного оператора!")
 
 # ---- Логирование ----
 logging.basicConfig(
@@ -30,6 +44,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+logger.info(f"Операторы: {OPERATOR_IDS}")
 
 # ---- Вспомогательная функция для безопасного форматирования (HTML) ----
 def format_sender_info_html(user):
@@ -44,7 +59,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message or not user:
         return
 
-    # Если сообщение от оператора – не пересылаем (чтобы не зациклить)
+    # Если сообщение от оператора – не пересылаем
     if user.id in OPERATOR_IDS:
         return
 
@@ -144,13 +159,12 @@ async def reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка при отправке ответа: {e}")
         await update.message.reply_text(f"❌ Не удалось отправить. Ошибка: {e}")
 
-# ---- Команда /operators (показывает список операторов, только для них же) ----
+# ---- Команда /operators (показывает список операторов) ----
 async def list_operators(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id not in OPERATOR_IDS:
         await update.message.reply_text("⛔ Нет прав.")
         return
-    # Получаем имена операторов (через getChat)
     names = []
     for op_id in OPERATOR_IDS:
         try:
@@ -171,11 +185,11 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("reply", reply_to_user))
-    app.add_handler(CommandHandler("operators", list_operators))  # опционально
+    app.add_handler(CommandHandler("operators", list_operators))
 
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
-    logger.info(f"🚀 Бот запущен. Операторы: {OPERATOR_IDS}")
+    logger.info(f"🚀 Бот запущен. Операторов: {len(OPERATOR_IDS)}")
     app.run_polling()
 
 if __name__ == "__main__":
