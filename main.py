@@ -16,27 +16,41 @@ OWNER_ID_STR = os.getenv("OWNER_ID", "")
 if not TOKEN:
     raise ValueError("BOT_TOKEN не задан в переменных окружения!")
 
+# ---- Универсальная функция для парсинга ID (поддерживает одиночные и через запятую) ----
+def parse_ids(id_str: str) -> list:
+    """Преобразует строку с ID (одиночным или через запятую) в список целых чисел."""
+    if not id_str.strip():
+        return []
+    # Разделяем по запятой, убираем пробелы, фильтруем пустые
+    parts = [x.strip() for x in id_str.split(",") if x.strip()]
+    ids = []
+    for part in parts:
+        try:
+            ids.append(int(part))
+        except ValueError:
+            raise ValueError(f"Некорректный ID: '{part}' — должно быть целое число")
+    return ids
+
 # ---- Определяем список операторов ----
 OPERATOR_IDS = []
 
-# Сначала пытаемся прочитать OPERATOR_IDS (список через запятую)
+# Сначала пробуем OPERATOR_IDS
 if OPERATOR_IDS_STR.strip():
-    try:
-        OPERATOR_IDS = [int(x.strip()) for x in OPERATOR_IDS_STR.split(",") if x.strip()]
-    except ValueError:
-        raise ValueError("OPERATOR_IDS должен содержать целые числа, разделённые запятыми")
+    OPERATOR_IDS = parse_ids(OPERATOR_IDS_STR)
+    if not OPERATOR_IDS:
+        raise ValueError("OPERATOR_IDS не содержит ни одного корректного ID")
 
-# Если OPERATOR_IDS пуст, пробуем использовать OWNER_ID (один оператор)
+# Если OPERATOR_IDS пуст, пробуем OWNER_ID
 if not OPERATOR_IDS and OWNER_ID_STR.strip():
-    try:
-        OPERATOR_IDS = [int(OWNER_ID_STR.strip())]
-        print("⚠️ Используется OWNER_ID как единственный оператор. Рекомендуется перейти на OPERATOR_IDS.")
-    except ValueError:
-        raise ValueError("OWNER_ID должен быть целым числом")
+    OPERATOR_IDS = parse_ids(OWNER_ID_STR)
+    if OPERATOR_IDS:
+        print("⚠️ Используется OWNER_ID как список операторов. Рекомендуется перейти на OPERATOR_IDS.")
+    else:
+        raise ValueError("OWNER_ID не содержит ни одного корректного ID")
 
 # Если всё равно пусто – ошибка
 if not OPERATOR_IDS:
-    raise ValueError("Не задан ни OPERATOR_IDS, ни OWNER_ID. Укажите хотя бы одного оператора!")
+    raise ValueError("Не задан ни OPERATOR_IDS, ни OWNER_ID с корректными ID. Укажите хотя бы одного оператора!")
 
 # ---- Логирование ----
 logging.basicConfig(
@@ -44,7 +58,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-logger.info(f"Операторы: {OPERATOR_IDS}")
+logger.info(f"Список операторов: {OPERATOR_IDS}")
 
 # ---- Вспомогательная функция для безопасного форматирования (HTML) ----
 def format_sender_info_html(user):
@@ -58,15 +72,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if not message or not user:
         return
-
-    # Если сообщение от оператора – не пересылаем
     if user.id in OPERATOR_IDS:
         return
 
     sender_info = format_sender_info_html(user)
 
     try:
-        # Пересылаем каждому оператору
         for operator_id in OPERATOR_IDS:
             if message.text:
                 safe_text = html.escape(message.text)
@@ -87,15 +98,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.HTML
                 )
             else:
-                # Стикеры, контакты, локации и т.п.
                 await message.copy(chat_id=operator_id)
                 await context.bot.send_message(
                     chat_id=operator_id,
                     text=sender_info,
                     parse_mode=ParseMode.HTML
                 )
-
-        # Подтверждение пользователю
         await message.reply_text("✅ Ваше сообщение передано в поддержку.")
     except Exception as e:
         logger.error(f"Ошибка при пересылке: {e}")
@@ -145,7 +153,6 @@ async def reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     reply_text = " ".join(args[1:])
-
     try:
         await context.bot.send_message(
             chat_id=target_user_id,
@@ -181,12 +188,10 @@ async def list_operators(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---- Запуск ----
 def main():
     app = Application.builder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("reply", reply_to_user))
     app.add_handler(CommandHandler("operators", list_operators))
-
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
     logger.info(f"🚀 Бот запущен. Операторов: {len(OPERATOR_IDS)}")
