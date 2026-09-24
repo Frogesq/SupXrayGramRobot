@@ -194,8 +194,8 @@ def set_ticket_status(tid: int, status: str):
 # ---------- Клавиатуры ----------
 def menu_kb():
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📬 Открытые", callback_data="list:open:0"),
-        InlineKeyboardButton("✅ Закрытые", callback_data="list:closed:0"),
+        InlineKeyboardButton("Открытые", callback_data="list:open:0"),
+        InlineKeyboardButton("Закрытые", callback_data="list:closed:0"),
     ]])
 
 
@@ -236,9 +236,9 @@ def tickets_list_kb(status: str, page: int = 0, per_page: int = 8):
 
 def ticket_view_kb(t):
     btn = (
-        InlineKeyboardButton("✅ Закрыть", callback_data=f"close:{t['ticket_id']}")
+        InlineKeyboardButton("Закрыть", callback_data=f"close:{t['ticket_id']}")
         if t["status"] == "open" else
-        InlineKeyboardButton("🔓 Открыть", callback_data=f"reopen:{t['ticket_id']}")
+        InlineKeyboardButton("Открыть", callback_data=f"reopen:{t['ticket_id']}")
     )
     return InlineKeyboardMarkup([
         [btn],
@@ -262,15 +262,15 @@ def render_ticket(tid: int, limit: int = 15):
     ).fetchall()[::-1]
     conn.close()
 
-    status = "🟢 открыт" if t["status"] == "open" else "🔴 закрыт"
+    status = "открыт" if t["status"] == "open" else "закрыт"
     uname = f"@{t['username']}" if t["username"] else ""
     head = (
-        f"🎫 <b>Тикет #{t['ticket_id']}</b> · {status}\n"
+        f"<b>Тикет #{t['ticket_id']}</b> · {status}\n"
         f"{esc(t['full_name'])} · <code>{t['user_id']}</code> {esc(uname)}"
     )
     lines = [head, "────────────"]
     for m in msgs:
-        who = "👤 <b>Оператор</b>" if m["is_operator"] else "🟦 <b>Пользователь</b>"
+        who = "<b>Оператор</b>" if m["is_operator"] else "<b>Пользователь</b>"
         lines.append(f"{who}\n{esc(m['text'])}")
     text = "\n\n".join(lines).strip()
     if len(text) > 3800:
@@ -288,7 +288,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = message.text or message.caption or "[медиа]"
     add_message(ticket_id, user.id, False, text)
 
-    header = f"🎫 <b>Тикет #{ticket_id}</b>\n{esc(user.full_name)} · <code>{user.id}</code>"
+    header = f"<b>Тикет #{ticket_id}</b>\n{esc(user.full_name)} · <code>{user.id}</code>"
 
     for op_id in OPERATOR_IDS:
         try:
@@ -355,7 +355,7 @@ async def handle_operator_reply(update: Update, context: ContextTypes.DEFAULT_TY
             )
 
         # уведомить других операторов
-        head = f"🎫 <b>Тикет #{ticket_id}</b> · ответ оператора"
+        head = f"<b>Тикет #{ticket_id}</b> · ответ оператора"
         for op_id in OPERATOR_IDS:
             if op_id == user.id:
                 continue
@@ -386,7 +386,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         save_user(user)
         await update.message.reply_text(
-            "Здравствуйте. Напишите сообщение — оператор ответит здесь."
+            "Здравствуйте. Подробно опишите вашу проблему, и операторы попробуют вам помочь. Спасибо!"
         )
 
 
@@ -561,7 +561,7 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("help", cmd_help)) 
     app.add_handler(CommandHandler("tickets", cmd_tickets))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("close", cmd_close))
