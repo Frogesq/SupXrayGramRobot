@@ -2,7 +2,8 @@ import os
 import html
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,10 +18,20 @@ load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 OPERATOR_IDS_STR = os.getenv("OPERATOR_IDS", "")
 OWNER_ID_STR = os.getenv("OWNER_ID", "")
-DB_PATH = os.getenv("DB_PATH", "support_bot.sqlite3")
+AUTO_CLOSE_HOURS = int(os.getenv("AUTO_CLOSE_HOURS", "24"))
 
 if not TOKEN:
     raise ValueError("BOT_TOKEN не задан")
+
+
+# База и логи лежат рядом со скриптом в ./data/
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_PATH = os.getenv("DB_PATH") or str(DATA_DIR / "support_bot.sqlite3")
+LOG_PATH = DATA_DIR / "bot.log"
+
 
 def parse_ids(s: str) -> list[int]:
     out = []
@@ -34,21 +45,31 @@ def parse_ids(s: str) -> list[int]:
             raise ValueError(f"Некорректный ID: {part}")
     return out
 
+
 OPERATOR_IDS = parse_ids(OPERATOR_IDS_STR) or parse_ids(OWNER_ID_STR)
 if not OPERATOR_IDS:
     raise ValueError("Не задан OPERATOR_IDS или OWNER_ID")
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler(LOG_PATH, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
 )
 log = logging.getLogger(__name__)
+log.info(f"DB: {DB_PATH}")
 
 
 # ---------- DB ----------
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
 
 def init_db():
     conn = db()
@@ -63,6 +84,9 @@ def init_db():
         ticket_id   INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id     INTEGER NOT NULL,
         status      TEXT NOT NULL DEFAULT 'open',
+        assigned_to INTEGER,
+        rating      INTEGER,
+        rated_at    TEXT,
         created_at  TEXT,
         updated_at  TEXT,
         closed_at   TEXT
@@ -85,15 +109,27 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
     CREATE INDEX IF NOT EXISTS idx_messages_ticket ON messages(ticket_id);
     """)
+    # мягкие миграции для старых БД
+    for ddl in (
+        "ALTER TABLE tickets ADD COLUMN assigned_to INTEGER",
+        "ALTER TABLE tickets ADD COLUMN rating INTEGER",
+        "ALTER TABLE tickets ADD COLUMN rated_at TEXT",
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     conn.close()
 
 
 def now() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+
 
 def esc(s: str | None) -> str:
     return html.escape(s or "")
+
 
 def is_operator(uid: int) -> bool:
     return uid in OPERATOR_IDS
@@ -111,6 +147,16 @@ def save_user(user):
     )
     conn.commit()
     conn.close()
+
+
+def has_open_ticket(user_id: int) -> bool:
+    conn = db()
+    row = conn.execute(
+        "SELECT 1 FROM tickets WHERE user_id=? AND status='open' LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    return row is not None
 
 
 def get_or_create_open_ticket(user_id: int) -> int:
@@ -191,6 +237,37 @@ def set_ticket_status(tid: int, status: str):
     conn.close()
 
 
+def set_rating(tid: int, score: int) -> bool:
+    conn = db()
+    row = conn.execute(
+        "SELECT rating FROM tickets WHERE ticket_id=?", (tid,)
+    ).fetchone()
+    if not row or row["rating"] is not None:
+        conn.close()
+        return False
+    conn.execute(
+        "UPDATE tickets SET rating=?, rated_at=? WHERE ticket_id=?",
+        (score, now(), tid),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def find_stale_open_tickets(hours: int) -> list:
+    threshold = (
+        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours)
+    ).isoformat(timespec="seconds")
+    conn = db()
+    rows = conn.execute(
+        "SELECT ticket_id, user_id FROM tickets "
+        "WHERE status='open' AND updated_at < ?",
+        (threshold,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
 # ---------- Клавиатуры ----------
 def menu_kb():
     return InlineKeyboardMarkup([[
@@ -202,7 +279,7 @@ def menu_kb():
 def tickets_list_kb(status: str, page: int = 0, per_page: int = 8):
     conn = db()
     rows = conn.execute(
-        "SELECT t.ticket_id, t.user_id, t.updated_at, u.full_name "
+        "SELECT t.ticket_id, t.user_id, t.updated_at, t.rating, u.full_name "
         "FROM tickets t LEFT JOIN users u ON u.user_id=t.user_id "
         "WHERE t.status=? ORDER BY t.updated_at DESC LIMIT ? OFFSET ?",
         (status, per_page, page * per_page),
@@ -215,22 +292,23 @@ def tickets_list_kb(status: str, page: int = 0, per_page: int = 8):
     buttons = []
     for r in rows:
         name = (r["full_name"] or str(r["user_id"]))[:22]
+        mark = f" [{r['rating']}/5]" if r["rating"] else ""
         buttons.append([InlineKeyboardButton(
-            f"#{r['ticket_id']} · {name}",
+            f"#{r['ticket_id']} · {name}{mark}",
             callback_data=f"ticket:{r['ticket_id']}",
         )])
 
     pages = max(1, (total + per_page - 1) // per_page)
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("‹", callback_data=f"list:{status}:{page-1}"))
+        nav.append(InlineKeyboardButton("<", callback_data=f"list:{status}:{page-1}"))
     nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="noop"))
     if (page + 1) * per_page < total:
-        nav.append(InlineKeyboardButton("›", callback_data=f"list:{status}:{page+1}"))
+        nav.append(InlineKeyboardButton(">", callback_data=f"list:{status}:{page+1}"))
     if nav:
         buttons.append(nav)
 
-    buttons.append([InlineKeyboardButton("← Меню", callback_data="menu")])
+    buttons.append([InlineKeyboardButton("Меню", callback_data="menu")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -242,8 +320,25 @@ def ticket_view_kb(t):
     )
     return InlineKeyboardMarkup([
         [btn],
-        [InlineKeyboardButton("← К списку", callback_data=f"list:{t['status']}:0")],
+        [InlineKeyboardButton("К списку", callback_data=f"list:{t['status']}:0")],
     ])
+
+
+def new_ticket_kb(ticket_id: int):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Открыть карточку", callback_data=f"ticket:{ticket_id}"),
+        InlineKeyboardButton("Закрыть", callback_data=f"close:{ticket_id}"),
+    ]])
+
+
+def rating_kb(ticket_id: int):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("1", callback_data=f"rate:{ticket_id}:1"),
+        InlineKeyboardButton("2", callback_data=f"rate:{ticket_id}:2"),
+        InlineKeyboardButton("3", callback_data=f"rate:{ticket_id}:3"),
+        InlineKeyboardButton("4", callback_data=f"rate:{ticket_id}:4"),
+        InlineKeyboardButton("5", callback_data=f"rate:{ticket_id}:5"),
+    ]])
 
 
 def render_ticket(tid: int, limit: int = 15):
@@ -272,10 +367,37 @@ def render_ticket(tid: int, limit: int = 15):
     for m in msgs:
         who = "<b>Оператор</b>" if m["is_operator"] else "<b>Пользователь</b>"
         lines.append(f"{who}\n{esc(m['text'])}")
+    if t["rating"]:
+        lines.append(f"────────────\nОценка пользователя: <b>{t['rating']}/5</b>")
     text = "\n\n".join(lines).strip()
     if len(text) > 3800:
         text = text[-3800:]
     return text, t
+
+
+# ---------- Закрытие + оценка ----------
+async def close_ticket_and_notify(bot, ticket_id: int, reason: str = "manual"):
+    set_ticket_status(ticket_id, "closed")
+    t = get_ticket(ticket_id)
+    if not t:
+        return
+    try:
+        if reason == "auto":
+            await bot.send_message(
+                t["user_id"],
+                f"Тикет #{ticket_id} закрыт автоматически из-за неактивности.\n"
+                "Если нужна помощь — просто напишите новое сообщение.\n\n"
+                "Оцените качество поддержки:",
+                reply_markup=rating_kb(ticket_id),
+            )
+        else:
+            await bot.send_message(
+                t["user_id"],
+                f"Тикет #{ticket_id} закрыт.\n\nОцените качество поддержки:",
+                reply_markup=rating_kb(ticket_id),
+            )
+    except Exception as e:
+        log.error(f"close notify {ticket_id}: {e}")
 
 
 # ---------- Пользователь ----------
@@ -284,11 +406,17 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     message = update.effective_message
     save_user(user)
 
+    is_new = not has_open_ticket(user.id)
     ticket_id = get_or_create_open_ticket(user.id)
     text = message.text or message.caption or "[медиа]"
     add_message(ticket_id, user.id, False, text)
 
-    header = f"<b>Тикет #{ticket_id}</b>\n{esc(user.full_name)} · <code>{user.id}</code>"
+    header = (
+        f"<b>Тикет #{ticket_id}</b>"
+        + (" · <b>NEW</b>" if is_new else "")
+        + f"\n{esc(user.full_name)} · <code>{user.id}</code>"
+    )
+    kb = new_ticket_kb(ticket_id) if is_new else None
 
     for op_id in OPERATOR_IDS:
         try:
@@ -297,6 +425,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     chat_id=op_id,
                     text=f"{header}\n\n{esc(message.text)}",
                     parse_mode=ParseMode.HTML,
+                    reply_markup=kb,
                 )
             else:
                 caption = header
@@ -306,12 +435,19 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     chat_id=op_id,
                     caption=caption,
                     parse_mode=ParseMode.HTML,
+                    reply_markup=kb,
                 )
             link_message(op_id, sent.message_id, ticket_id, user.id)
         except Exception as e:
             log.error(f"send to op {op_id}: {e}")
 
-    await message.reply_text(f"Тикет #{ticket_id} создан. Оператор ответит здесь.")
+    if is_new:
+        await message.reply_text(
+            f"<b>Тикет #{ticket_id} создан</b>\n\n"
+            "Оператор скоро ответит прямо здесь.\n"
+            "Если нужно что-то добавить — просто напишите ещё сообщение.",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 # ---------- Оператор: свайп-ответ ----------
@@ -354,7 +490,6 @@ async def handle_operator_reply(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode=ParseMode.HTML,
             )
 
-        # уведомить других операторов
         head = f"<b>Тикет #{ticket_id}</b> · ответ оператора"
         for op_id in OPERATOR_IDS:
             if op_id == user.id:
@@ -380,13 +515,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if is_operator(user.id):
         await update.message.reply_text(
-            "Панель оператора.\n/tickets — тикеты\n/stats — статистика\n\n"
+            "Панель оператора.\n"
+            "/tickets — тикеты\n"
+            "/stats — статистика\n\n"
             "Чтобы ответить пользователю — свайпните на его сообщение."
         )
     else:
         save_user(user)
         await update.message.reply_text(
-            "Здравствуйте. Подробно опишите вашу проблему, и операторы попробуют вам помочь. Спасибо!"
+            "Здравствуйте. Подробно опишите вашу проблему, "
+            "и операторы попробуют вам помочь. Спасибо!"
         )
 
 
@@ -419,15 +557,26 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = db()
     o = conn.execute("SELECT COUNT(*) FROM tickets WHERE status='open'").fetchone()[0]
     c = conn.execute("SELECT COUNT(*) FROM tickets WHERE status='closed'").fetchone()[0]
+    r = conn.execute(
+        "SELECT AVG(rating), COUNT(rating) FROM tickets WHERE rating IS NOT NULL"
+    ).fetchone()
     conn.close()
-    await update.message.reply_text(f"Открытых: {o}\nЗакрытых: {c}")
+    avg = f"{r[0]:.2f}" if r[0] else "—"
+    text = (
+        f"Открытых: {o}\n"
+        f"Закрытых: {c}\n"
+        f"Средняя оценка: {avg} ({r[1]} оценок)"
+    )
+    await update.message.reply_text(text)
 
 
 async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_operator(update.effective_user.id):
         return
     if not context.args:
-        await update.message.reply_text("Использование: /close &lt;id&gt;", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            "Использование: /close &lt;id&gt;", parse_mode=ParseMode.HTML
+        )
         return
     try:
         tid = int(context.args[0])
@@ -438,19 +587,17 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not t:
         await update.message.reply_text("Тикет не найден.")
         return
-    set_ticket_status(tid, "closed")
+    await close_ticket_and_notify(context.bot, tid, reason="manual")
     await update.message.reply_text(f"Тикет #{tid} закрыт.")
-    try:
-        await context.bot.send_message(t["user_id"], f"Тикет #{tid} закрыт.")
-    except Exception:
-        pass
 
 
 async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_operator(update.effective_user.id):
         return
     if not context.args:
-        await update.message.reply_text("Использование: /open &lt;id&gt;", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            "Использование: /open &lt;id&gt;", parse_mode=ParseMode.HTML
+        )
         return
     try:
         tid = int(context.args[0])
@@ -465,7 +612,35 @@ async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Тикет #{tid} открыт.")
 
 
-# ---------- Callback-роутер ----------
+# ---------- Callback: оценка (только пользователь) ----------
+async def user_cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data
+    if not data.startswith("rate:"):
+        return
+    _, tid_s, score_s = data.split(":")
+    tid = int(tid_s)
+    score = int(score_s)
+
+    t = get_ticket(tid)
+    if not t:
+        await q.answer("Тикет не найден", show_alert=True)
+        return
+    if t["user_id"] != q.from_user.id:
+        await q.answer("Это не ваш тикет.", show_alert=True)
+        return
+    if not set_rating(tid, score):
+        await q.answer("Оценка уже получена. Спасибо!", show_alert=True)
+        return
+
+    await q.answer("Спасибо за оценку!")
+    try:
+        await q.edit_message_text(f"Тикет #{tid} закрыт. Оценка: {score}/5. Спасибо!")
+    except Exception:
+        pass
+
+
+# ---------- Callback: оператор ----------
 async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not is_operator(update.effective_user.id):
@@ -500,7 +675,10 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tid = int(data.split(":")[1])
         text, t = render_ticket(tid)
         if not t:
-            await q.edit_message_text("Тикет не найден.")
+            try:
+                await q.edit_message_text("Тикет не найден.")
+            except Exception:
+                pass
             return
         try:
             await q.edit_message_text(
@@ -510,12 +688,12 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.error(f"render ticket: {e}")
         return
 
-    if data.startswith(("close:", "reopen:")):
-        action, tid_s = data.split(":")
-        tid = int(tid_s)
-        new_status = "closed" if action == "close" else "open"
-        set_ticket_status(tid, new_status)
-
+    if data.startswith("close:"):
+        tid = int(data.split(":")[1])
+        t = get_ticket(tid)
+        if not t:
+            return
+        await close_ticket_and_notify(context.bot, tid, reason="manual")
         text, t = render_ticket(tid)
         try:
             await q.edit_message_text(
@@ -523,20 +701,35 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
+        return
 
+    if data.startswith("reopen:"):
+        tid = int(data.split(":")[1])
+        set_ticket_status(tid, "open")
+        text, t = render_ticket(tid)
         try:
-            if new_status == "closed":
-                await context.bot.send_message(
-                    t["user_id"],
-                    f"Тикет #{tid} закрыт. Напишите снова, если понадобится помощь.",
-                )
-            else:
-                await context.bot.send_message(
-                    t["user_id"], f"Тикет #{tid} снова открыт."
-                )
+            await q.edit_message_text(
+                text, parse_mode=ParseMode.HTML, reply_markup=ticket_view_kb(t)
+            )
+        except Exception:
+            pass
+        try:
+            await context.bot.send_message(
+                t["user_id"], f"Тикет #{tid} снова открыт."
+            )
         except Exception:
             pass
         return
+
+
+# ---------- Авто-закрытие ----------
+async def auto_close_job(context: ContextTypes.DEFAULT_TYPE):
+    rows = find_stale_open_tickets(AUTO_CLOSE_HOURS)
+    if not rows:
+        return
+    log.info(f"Авто-закрытие: {len(rows)} тикет(ов)")
+    for r in rows:
+        await close_ticket_and_notify(context.bot, r["ticket_id"], reason="auto")
 
 
 # ---------- Диспетчер личных сообщений ----------
@@ -549,7 +742,6 @@ async def handle_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_operator(user.id):
         if message.reply_to_message:
             await handle_operator_reply(update, context)
-        # оператор без свайпа — игнорируем, пусть пользуется /tickets
         return
 
     await handle_user_message(update, context)
@@ -561,16 +753,26 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help)) 
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("tickets", cmd_tickets))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("close", cmd_close))
     app.add_handler(CommandHandler("open", cmd_open))
+
+    # rate: обрабатывается отдельно — это клик пользователя, не оператора
+    app.add_handler(CallbackQueryHandler(user_cb_router, pattern=r"^rate:"))
     app.add_handler(CallbackQueryHandler(cb_router))
+
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND,
         handle_private,
     ))
+
+    # Авто-закрытие каждые 30 минут, первый запуск через 60 сек
+    if app.job_queue:
+        app.job_queue.run_repeating(auto_close_job, interval=1800, first=60)
+    else:
+        log.warning("JobQueue недоступен — авто-закрытие отключено")
 
     log.info(f"Бот запущен. Операторов: {len(OPERATOR_IDS)}")
     app.run_polling()
