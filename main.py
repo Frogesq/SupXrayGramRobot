@@ -4,7 +4,6 @@ import logging
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -23,12 +22,10 @@ AUTO_CLOSE_HOURS = int(os.getenv("AUTO_CLOSE_HOURS", "24"))
 if not TOKEN:
     raise ValueError("BOT_TOKEN не задан")
 
-
 # База и логи лежат рядом со скриптом в ./data/
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-
 DB_PATH = os.getenv("DB_PATH") or str(DATA_DIR / "support_bot.sqlite3")
 LOG_PATH = DATA_DIR / "bot.log"
 
@@ -105,6 +102,12 @@ def init_db():
         ticket_id       INTEGER NOT NULL,
         user_id         INTEGER NOT NULL,
         PRIMARY KEY (operator_id, operator_msg_id)
+    );
+    CREATE TABLE IF NOT EXISTS bans (
+        user_id     INTEGER PRIMARY KEY,
+        banned_at   TEXT NOT NULL,
+        banned_by   INTEGER,
+        reason      TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
     CREATE INDEX IF NOT EXISTS idx_messages_ticket ON messages(ticket_id);
@@ -268,6 +271,67 @@ def find_stale_open_tickets(hours: int) -> list:
     return rows
 
 
+# ---------- Ban helpers ----------
+def is_banned(user_id: int) -> bool:
+    conn = db()
+    row = conn.execute(
+        "SELECT 1 FROM bans WHERE user_id=? LIMIT 1", (user_id,)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def ban_user(user_id: int, banned_by: int, reason: str | None = None) -> bool:
+    """Возвращает True если пользователь был забанен, False если уже был в бане."""
+    if is_banned(user_id):
+        return False
+    conn = db()
+    conn.execute(
+        "INSERT INTO bans(user_id, banned_at, banned_by, reason) VALUES (?, ?, ?, ?)",
+        (user_id, now(), banned_by, reason),
+    )
+    # закрываем все открытые тикеты забаненного
+    conn.execute(
+        "UPDATE tickets SET status='closed', closed_at=? "
+        "WHERE user_id=? AND status='open'",
+        (now(), user_id),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def unban_user(user_id: int) -> bool:
+    """Возвращает True если пользователь был разбанен."""
+    conn = db()
+    cur = conn.execute("DELETE FROM bans WHERE user_id=?", (user_id,))
+    conn.commit()
+    changed = cur.rowcount > 0
+    conn.close()
+    return changed
+
+
+def get_ban_info(user_id: int):
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM bans WHERE user_id=?", (user_id,)
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def list_bans(limit: int = 50):
+    conn = db()
+    rows = conn.execute(
+        "SELECT b.*, u.full_name, u.username "
+        "FROM bans b LEFT JOIN users u ON u.user_id = b.user_id "
+        "ORDER BY b.banned_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
 # ---------- Клавиатуры ----------
 def menu_kb():
     return InlineKeyboardMarkup([[
@@ -288,7 +352,6 @@ def tickets_list_kb(status: str, page: int = 0, per_page: int = 8):
         "SELECT COUNT(*) FROM tickets WHERE status=?", (status,)
     ).fetchone()[0]
     conn.close()
-
     buttons = []
     for r in rows:
         name = (r["full_name"] or str(r["user_id"]))[:22]
@@ -297,7 +360,6 @@ def tickets_list_kb(status: str, page: int = 0, per_page: int = 8):
             f"#{r['ticket_id']} · {name}{mark}",
             callback_data=f"ticket:{r['ticket_id']}",
         )])
-
     pages = max(1, (total + per_page - 1) // per_page)
     nav = []
     if page > 0:
@@ -307,7 +369,6 @@ def tickets_list_kb(status: str, page: int = 0, per_page: int = 8):
         nav.append(InlineKeyboardButton(">", callback_data=f"list:{status}:{page+1}"))
     if nav:
         buttons.append(nav)
-
     buttons.append([InlineKeyboardButton("Меню", callback_data="menu")])
     return InlineKeyboardMarkup(buttons)
 
@@ -356,7 +417,6 @@ def render_ticket(tid: int, limit: int = 15):
         (tid, limit),
     ).fetchall()[::-1]
     conn.close()
-
     status = "открыт" if t["status"] == "open" else "закрыт"
     uname = f"@{t['username']}" if t["username"] else ""
     head = (
@@ -406,6 +466,18 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     message = update.effective_message
     save_user(user)
 
+    # Проверка бана
+    if is_banned(user.id):
+        ban = get_ban_info(user.id)
+        reason = ban["reason"] if ban and ban["reason"] else "не указана"
+        await message.reply_text(
+            f"Вы заблокированы в боте поддержки.\n"
+            f"Причина: {esc(reason)}\n\n"
+            "Если считаете, что это ошибка — обратитесь к администрации другим способом.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     is_new = not has_open_ticket(user.id)
     ticket_id = get_or_create_open_ticket(user.id)
     text = message.text or message.caption or "[медиа]"
@@ -454,25 +526,20 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def handle_operator_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
-
     link = lookup_link(user.id, message.reply_to_message.message_id)
     if not link:
         await message.reply_text("Не удалось найти тикет для этого сообщения.")
         return
-
     ticket_id = link["ticket_id"]
     target_uid = link["user_id"]
-
     t = get_ticket(ticket_id)
     if t and t["status"] != "open":
         await message.reply_text(
             f"Тикет #{ticket_id} закрыт. Откройте: /open {ticket_id}"
         )
         return
-
     text = message.text or message.caption or "[медиа]"
     add_message(ticket_id, user.id, True, text)
-
     try:
         if message.text:
             await context.bot.send_message(
@@ -489,7 +556,6 @@ async def handle_operator_reply(update: Update, context: ContextTypes.DEFAULT_TY
                 caption=caption,
                 parse_mode=ParseMode.HTML,
             )
-
         head = f"<b>Тикет #{ticket_id}</b> · ответ оператора"
         for op_id in OPERATOR_IDS:
             if op_id == user.id:
@@ -503,7 +569,6 @@ async def handle_operator_reply(update: Update, context: ContextTypes.DEFAULT_TY
                 link_message(op_id, sent.message_id, ticket_id, target_uid)
             except Exception:
                 pass
-
         await message.reply_text(f"Отправлено. Тикет #{ticket_id}.")
     except Exception as e:
         log.error(f"reply fail: {e}")
@@ -517,10 +582,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Панель оператора.\n"
             "/tickets — тикеты\n"
-            "/stats — статистика\n\n"
-            "Чтобы ответить пользователю — свайпните на его сообщение."
+            "/stats — статистика\n"
+            "/ban &lt;id&gt; [причина] — забанить\n"
+            "/unban &lt;id&gt; — разбанить\n"
+            "/banlist — список банов\n\n"
+            "Чтобы ответить пользователю — свайпните на его сообщение.",
+            parse_mode=ParseMode.HTML,
         )
     else:
+        if is_banned(user.id):
+            ban = get_ban_info(user.id)
+            reason = ban["reason"] if ban and ban["reason"] else "не указана"
+            await update.message.reply_text(
+                f"Вы заблокированы в боте поддержки.\nПричина: {esc(reason)}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
         save_user(user)
         await update.message.reply_text(
             "Здравствуйте. Подробно опишите вашу проблему, "
@@ -534,8 +611,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "/tickets — список тикетов\n"
             "/stats — статистика\n"
-            "/close &lt;id&gt; — закрыть\n"
-            "/open &lt;id&gt; — открыть\n\n"
+            "/close &lt;id&gt; — закрыть тикет\n"
+            "/open &lt;id&gt; — открыть тикет\n"
+            "/ban &lt;id&gt; [причина] — забанить пользователя\n"
+            "/unban &lt;id&gt; — разбанить\n"
+            "/banlist — список забаненных\n\n"
             "Ответ — свайпом на сообщение пользователя.",
             parse_mode=ParseMode.HTML,
         )
@@ -560,12 +640,14 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = conn.execute(
         "SELECT AVG(rating), COUNT(rating) FROM tickets WHERE rating IS NOT NULL"
     ).fetchone()
+    bans_count = conn.execute("SELECT COUNT(*) FROM bans").fetchone()[0]
     conn.close()
     avg = f"{r[0]:.2f}" if r[0] else "—"
     text = (
         f"Открытых: {o}\n"
         f"Закрытых: {c}\n"
-        f"Средняя оценка: {avg} ({r[1]} оценок)"
+        f"Средняя оценка: {avg} ({r[1]} оценок)\n"
+        f"Забанено: {bans_count}"
     )
     await update.message.reply_text(text)
 
@@ -612,6 +694,110 @@ async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Тикет #{tid} открыт.")
 
 
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_operator(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: /ban &lt;user_id&gt; [причина]",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("user_id должен быть числом.")
+        return
+
+    if is_operator(uid):
+        await update.message.reply_text("Нельзя забанить оператора.")
+        return
+
+    reason = " ".join(context.args[1:]).strip() or None
+    was_banned = ban_user(uid, update.effective_user.id, reason)
+
+    if not was_banned:
+        await update.message.reply_text(f"Пользователь <code>{uid}</code> уже забанен.", parse_mode=ParseMode.HTML)
+        return
+
+    # уведомляем пользователя
+    try:
+        reason_text = reason or "не указана"
+        await context.bot.send_message(
+            uid,
+            f"Вы заблокированы в боте поддержки.\nПричина: {esc(reason_text)}",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+    reason_info = f"\nПричина: {esc(reason)}" if reason else ""
+    await update.message.reply_text(
+        f"Пользователь <code>{uid}</code> забанен.{reason_info}\n"
+        f"Все его открытые тикеты закрыты.",
+        parse_mode=ParseMode.HTML,
+    )
+    log.info(f"Ban: {uid} by {update.effective_user.id}, reason={reason}")
+
+
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_operator(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: /unban &lt;user_id&gt;",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("user_id должен быть числом.")
+        return
+
+    if not unban_user(uid):
+        await update.message.reply_text(f"Пользователь <code>{uid}</code> не был забанен.", parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        await context.bot.send_message(
+            uid,
+            "Вы разблокированы в боте поддержки. Можете снова писать сообщения.",
+        )
+    except Exception:
+        pass
+
+    await update.message.reply_text(
+        f"Пользователь <code>{uid}</code> разбанен.",
+        parse_mode=ParseMode.HTML,
+    )
+    log.info(f"Unban: {uid} by {update.effective_user.id}")
+
+
+async def cmd_banlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_operator(update.effective_user.id):
+        return
+    rows = list_bans(40)
+    if not rows:
+        await update.message.reply_text("Список банов пуст.")
+        return
+
+    lines = ["<b>Забаненные пользователи:</b>\n"]
+    for r in rows:
+        name = r["full_name"] or "—"
+        uname = f"@{r['username']}" if r["username"] else ""
+        reason = r["reason"] or "—"
+        lines.append(
+            f"• <code>{r['user_id']}</code> {esc(name)} {esc(uname)}\n"
+            f"  Причина: {esc(reason)}\n"
+            f"  Дата: {r['banned_at'][:16]}"
+        )
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n…"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
 # ---------- Callback: оценка (только пользователь) ----------
 async def user_cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -621,7 +807,6 @@ async def user_cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, tid_s, score_s = data.split(":")
     tid = int(tid_s)
     score = int(score_s)
-
     t = get_ticket(tid)
     if not t:
         await q.answer("Тикет не найден", show_alert=True)
@@ -632,7 +817,6 @@ async def user_cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not set_rating(tid, score):
         await q.answer("Оценка уже получена. Спасибо!", show_alert=True)
         return
-
     await q.answer("Спасибо за оценку!")
     try:
         await q.edit_message_text(f"Тикет #{tid} закрыт. Оценка: {score}/5. Спасибо!")
@@ -648,17 +832,14 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     data = q.data
     await q.answer()
-
     if data == "noop":
         return
-
     if data == "menu":
         try:
             await q.edit_message_text("Тикеты:", reply_markup=menu_kb())
         except Exception:
             pass
         return
-
     if data.startswith("list:"):
         _, status, page = data.split(":")
         page = int(page)
@@ -670,7 +851,6 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         return
-
     if data.startswith("ticket:"):
         tid = int(data.split(":")[1])
         text, t = render_ticket(tid)
@@ -687,7 +867,6 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.error(f"render ticket: {e}")
         return
-
     if data.startswith("close:"):
         tid = int(data.split(":")[1])
         t = get_ticket(tid)
@@ -702,7 +881,6 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         return
-
     if data.startswith("reopen:"):
         tid = int(data.split(":")[1])
         set_ticket_status(tid, "open")
@@ -738,12 +916,10 @@ async def handle_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if not user or not message:
         return
-
     if is_operator(user.id):
         if message.reply_to_message:
             await handle_operator_reply(update, context)
         return
-
     await handle_user_message(update, context)
 
 
@@ -758,11 +934,13 @@ def main():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("close", cmd_close))
     app.add_handler(CommandHandler("open", cmd_open))
+    app.add_handler(CommandHandler("ban", cmd_ban))
+    app.add_handler(CommandHandler("unban", cmd_unban))
+    app.add_handler(CommandHandler("banlist", cmd_banlist))
 
     # rate: обрабатывается отдельно — это клик пользователя, не оператора
     app.add_handler(CallbackQueryHandler(user_cb_router, pattern=r"^rate:"))
     app.add_handler(CallbackQueryHandler(cb_router))
-
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND,
         handle_private,
