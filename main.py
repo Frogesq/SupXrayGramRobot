@@ -15,14 +15,11 @@ from telegram.ext import (
 # ---------- ENV ----------
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-OPERATOR_IDS_STR = os.getenv("OPERATOR_IDS", "")
-OWNER_ID_STR = os.getenv("OWNER_ID", "")
 AUTO_CLOSE_HOURS = int(os.getenv("AUTO_CLOSE_HOURS", "24"))
 
 if not TOKEN:
     raise ValueError("BOT_TOKEN не задан")
 
-# База и логи лежат рядом со скриптом в ./data/
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -43,9 +40,60 @@ def parse_ids(s: str) -> list[int]:
     return out
 
 
-OPERATOR_IDS = parse_ids(OPERATOR_IDS_STR) or parse_ids(OWNER_ID_STR)
-if not OPERATOR_IDS:
-    raise ValueError("Не задан OPERATOR_IDS или OWNER_ID")
+# Ранги
+OWNER_IDS = parse_ids(os.getenv("OWNER_IDS", "") or os.getenv("OWNER_ID", ""))
+OPERATOR_L3 = parse_ids(os.getenv("OPERATOR_L3", ""))
+OPERATOR_L2 = parse_ids(os.getenv("OPERATOR_L2", ""))
+OPERATOR_L1 = parse_ids(os.getenv("OPERATOR_L1", ""))
+
+# Обратная совместимость со старым OPERATOR_IDS
+_old_ops = parse_ids(os.getenv("OPERATOR_IDS", ""))
+if _old_ops and not (OPERATOR_L1 or OPERATOR_L2 or OPERATOR_L3):
+    OPERATOR_L2 = _old_ops  # старые операторы = 2 уровень
+
+ALL_OPERATOR_IDS = list(set(OWNER_IDS + OPERATOR_L3 + OPERATOR_L2 + OPERATOR_L1))
+
+if not ALL_OPERATOR_IDS:
+    raise ValueError("Не задан ни один оператор/владелец (OWNER_IDS / OPERATOR_L1/L2/L3)")
+
+# Права по рангам
+ROLE_PERMS = {
+    "owner": {"reply", "view", "close", "stats", "ban", "banlist"},
+    "l3":    {"reply", "view", "close", "stats", "ban", "banlist"},
+    "l2":    {"reply", "view", "close", "stats"},
+    "l1":    {"reply", "view"},
+}
+
+ROLE_NAMES = {
+    "owner": "Владелец",
+    "l3": "Оператор 3 уровня",
+    "l2": "Оператор 2 уровня",
+    "l1": "Оператор 1 уровня",
+}
+
+
+def get_role(uid: int) -> str | None:
+    if uid in OWNER_IDS:
+        return "owner"
+    if uid in OPERATOR_L3:
+        return "l3"
+    if uid in OPERATOR_L2:
+        return "l2"
+    if uid in OPERATOR_L1:
+        return "l1"
+    return None
+
+
+def is_operator(uid: int) -> bool:
+    return uid in ALL_OPERATOR_IDS
+
+
+def has_perm(uid: int, perm: str) -> bool:
+    role = get_role(uid)
+    if not role:
+        return False
+    return perm in ROLE_PERMS.get(role, set())
+
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -57,6 +105,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 log.info(f"DB: {DB_PATH}")
+log.info(
+    f"Ранги: Owner={len(OWNER_IDS)}, L3={len(OPERATOR_L3)}, "
+    f"L2={len(OPERATOR_L2)}, L1={len(OPERATOR_L1)}"
+)
 
 
 # ---------- DB ----------
@@ -112,7 +164,6 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
     CREATE INDEX IF NOT EXISTS idx_messages_ticket ON messages(ticket_id);
     """)
-    # мягкие миграции для старых БД
     for ddl in (
         "ALTER TABLE tickets ADD COLUMN assigned_to INTEGER",
         "ALTER TABLE tickets ADD COLUMN rating INTEGER",
@@ -132,10 +183,6 @@ def now() -> str:
 
 def esc(s: str | None) -> str:
     return html.escape(s or "")
-
-
-def is_operator(uid: int) -> bool:
-    return uid in OPERATOR_IDS
 
 
 # ---------- DB helpers ----------
@@ -282,7 +329,6 @@ def is_banned(user_id: int) -> bool:
 
 
 def ban_user(user_id: int, banned_by: int, reason: str | None = None) -> bool:
-    """Возвращает True если пользователь был забанен, False если уже был в бане."""
     if is_banned(user_id):
         return False
     conn = db()
@@ -290,7 +336,6 @@ def ban_user(user_id: int, banned_by: int, reason: str | None = None) -> bool:
         "INSERT INTO bans(user_id, banned_at, banned_by, reason) VALUES (?, ?, ?, ?)",
         (user_id, now(), banned_by, reason),
     )
-    # закрываем все открытые тикеты забаненного
     conn.execute(
         "UPDATE tickets SET status='closed', closed_at=? "
         "WHERE user_id=? AND status='open'",
@@ -302,7 +347,6 @@ def ban_user(user_id: int, banned_by: int, reason: str | None = None) -> bool:
 
 
 def unban_user(user_id: int) -> bool:
-    """Возвращает True если пользователь был разбанен."""
     conn = db()
     cur = conn.execute("DELETE FROM bans WHERE user_id=?", (user_id,))
     conn.commit()
@@ -373,16 +417,17 @@ def tickets_list_kb(status: str, page: int = 0, per_page: int = 8):
     return InlineKeyboardMarkup(buttons)
 
 
-def ticket_view_kb(t):
-    btn = (
-        InlineKeyboardButton("Закрыть", callback_data=f"close:{t['ticket_id']}")
-        if t["status"] == "open" else
-        InlineKeyboardButton("Открыть", callback_data=f"reopen:{t['ticket_id']}")
-    )
-    return InlineKeyboardMarkup([
-        [btn],
-        [InlineKeyboardButton("К списку", callback_data=f"list:{t['status']}:0")],
-    ])
+def ticket_view_kb(t, uid: int):
+    buttons = []
+    if has_perm(uid, "close"):
+        btn = (
+            InlineKeyboardButton("Закрыть", callback_data=f"close:{t['ticket_id']}")
+            if t["status"] == "open" else
+            InlineKeyboardButton("Открыть", callback_data=f"reopen:{t['ticket_id']}")
+        )
+        buttons.append([btn])
+    buttons.append([InlineKeyboardButton("К списку", callback_data=f"list:{t['status']}:0")])
+    return InlineKeyboardMarkup(buttons)
 
 
 def new_ticket_kb(ticket_id: int):
@@ -466,7 +511,6 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     message = update.effective_message
     save_user(user)
 
-    # Проверка бана
     if is_banned(user.id):
         ban = get_ban_info(user.id)
         reason = ban["reason"] if ban and ban["reason"] else "не указана"
@@ -490,7 +534,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     kb = new_ticket_kb(ticket_id) if is_new else None
 
-    for op_id in OPERATOR_IDS:
+    for op_id in ALL_OPERATOR_IDS:
         try:
             if message.text:
                 sent = await context.bot.send_message(
@@ -526,6 +570,11 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def handle_operator_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
+
+    if not has_perm(user.id, "reply"):
+        await message.reply_text("У вас нет прав отвечать на тикеты.")
+        return
+
     link = lookup_link(user.id, message.reply_to_message.message_id)
     if not link:
         await message.reply_text("Не удалось найти тикет для этого сообщения.")
@@ -557,7 +606,7 @@ async def handle_operator_reply(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode=ParseMode.HTML,
             )
         head = f"<b>Тикет #{ticket_id}</b> · ответ оператора"
-        for op_id in OPERATOR_IDS:
+        for op_id in ALL_OPERATOR_IDS:
             if op_id == user.id:
                 continue
             try:
@@ -578,17 +627,26 @@ async def handle_operator_reply(update: Update, context: ContextTypes.DEFAULT_TY
 # ---------- Команды ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if is_operator(user.id):
-        await update.message.reply_text(
-            "Панель оператора.\n"
-            "/tickets — тикеты\n"
-            "/stats — статистика\n"
-            "/ban &lt;id&gt; [причина] — забанить\n"
-            "/unban &lt;id&gt; — разбанить\n"
-            "/banlist — список банов\n\n"
-            "Чтобы ответить пользователю — свайпните на его сообщение.",
-            parse_mode=ParseMode.HTML,
-        )
+    role = get_role(user.id)
+
+    if role:
+        role_name = ROLE_NAMES.get(role, role)
+        lines = [
+            f"Панель оператора · <b>{role_name}</b>\n",
+            "/tickets — тикеты",
+        ]
+        if has_perm(user.id, "stats"):
+            lines.append("/stats — статистика")
+        if has_perm(user.id, "close"):
+            lines.append("/close <id> — закрыть тикет")
+            lines.append("/open <id> — открыть тикет")
+        if has_perm(user.id, "ban"):
+            lines.append("/ban <id> [причина] — забанить")
+            lines.append("/unban <id> — разбанить")
+        if has_perm(user.id, "banlist"):
+            lines.append("/banlist — список банов")
+        lines.append("\nЧтобы ответить пользователю — свайпните на его сообщение.")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
     else:
         if is_banned(user.id):
             ban = get_ban_info(user.id)
@@ -607,32 +665,40 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if is_operator(user.id):
-        await update.message.reply_text(
-            "/tickets — список тикетов\n"
-            "/stats — статистика\n"
-            "/close &lt;id&gt; — закрыть тикет\n"
-            "/open &lt;id&gt; — открыть тикет\n"
-            "/ban &lt;id&gt; [причина] — забанить пользователя\n"
-            "/unban &lt;id&gt; — разбанить\n"
-            "/banlist — список забаненных\n\n"
-            "Ответ — свайпом на сообщение пользователя.",
-            parse_mode=ParseMode.HTML,
-        )
-    else:
+    role = get_role(user.id)
+
+    if not role:
         await update.message.reply_text(
             "Просто напишите сообщение — оператор ответит здесь."
         )
+        return
+
+    role_name = ROLE_NAMES.get(role, role)
+    lines = [f"<b>{role_name}</b>\n"]
+    lines.append("/tickets — список тикетов")
+    if has_perm(user.id, "stats"):
+        lines.append("/stats — статистика")
+    if has_perm(user.id, "close"):
+        lines.append("/close &lt;id&gt; — закрыть тикет")
+        lines.append("/open &lt;id&gt; — открыть тикет")
+    if has_perm(user.id, "ban"):
+        lines.append("/ban &lt;id&gt; [причина] — забанить")
+        lines.append("/unban &lt;id&gt; — разбанить")
+    if has_perm(user.id, "banlist"):
+        lines.append("/banlist — список забаненных")
+    lines.append("\nОтвет — свайпом на сообщение пользователя.")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def cmd_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_operator(update.effective_user.id):
+    if not has_perm(update.effective_user.id, "view"):
         return
     await update.message.reply_text("Тикеты:", reply_markup=menu_kb())
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_operator(update.effective_user.id):
+    if not has_perm(update.effective_user.id, "stats"):
+        await update.message.reply_text("Недостаточно прав.")
         return
     conn = db()
     o = conn.execute("SELECT COUNT(*) FROM tickets WHERE status='open'").fetchone()[0]
@@ -653,7 +719,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_operator(update.effective_user.id):
+    if not has_perm(update.effective_user.id, "close"):
+        await update.message.reply_text("Недостаточно прав.")
         return
     if not context.args:
         await update.message.reply_text(
@@ -674,7 +741,8 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_operator(update.effective_user.id):
+    if not has_perm(update.effective_user.id, "close"):
+        await update.message.reply_text("Недостаточно прав.")
         return
     if not context.args:
         await update.message.reply_text(
@@ -695,7 +763,8 @@ async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_operator(update.effective_user.id):
+    if not has_perm(update.effective_user.id, "ban"):
+        await update.message.reply_text("Недостаточно прав.")
         return
     if not context.args:
         await update.message.reply_text(
@@ -710,17 +779,18 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if is_operator(uid):
-        await update.message.reply_text("Нельзя забанить оператора.")
+        await update.message.reply_text("Нельзя забанить оператора/владельца.")
         return
 
     reason = " ".join(context.args[1:]).strip() or None
     was_banned = ban_user(uid, update.effective_user.id, reason)
 
     if not was_banned:
-        await update.message.reply_text(f"Пользователь <code>{uid}</code> уже забанен.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"Пользователь <code>{uid}</code> уже забанен.", parse_mode=ParseMode.HTML
+        )
         return
 
-    # уведомляем пользователя
     try:
         reason_text = reason or "не указана"
         await context.bot.send_message(
@@ -741,7 +811,8 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_operator(update.effective_user.id):
+    if not has_perm(update.effective_user.id, "ban"):
+        await update.message.reply_text("Недостаточно прав.")
         return
     if not context.args:
         await update.message.reply_text(
@@ -756,7 +827,9 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not unban_user(uid):
-        await update.message.reply_text(f"Пользователь <code>{uid}</code> не был забанен.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"Пользователь <code>{uid}</code> не был забанен.", parse_mode=ParseMode.HTML
+        )
         return
 
     try:
@@ -775,7 +848,8 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_banlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_operator(update.effective_user.id):
+    if not has_perm(update.effective_user.id, "banlist"):
+        await update.message.reply_text("Недостаточно прав.")
         return
     rows = list_bans(40)
     if not rows:
@@ -827,20 +901,30 @@ async def user_cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Callback: оператор ----------
 async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not is_operator(update.effective_user.id):
+    uid = update.effective_user.id
+
+    if not is_operator(uid):
         await q.answer("Нет прав", show_alert=True)
         return
+
     data = q.data
     await q.answer()
+
     if data == "noop":
         return
+
     if data == "menu":
+        if not has_perm(uid, "view"):
+            return
         try:
             await q.edit_message_text("Тикеты:", reply_markup=menu_kb())
         except Exception:
             pass
         return
+
     if data.startswith("list:"):
+        if not has_perm(uid, "view"):
+            return
         _, status, page = data.split(":")
         page = int(page)
         title = "Открытые" if status == "open" else "Закрытые"
@@ -851,7 +935,10 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         return
+
     if data.startswith("ticket:"):
+        if not has_perm(uid, "view"):
+            return
         tid = int(data.split(":")[1])
         text, t = render_ticket(tid)
         if not t:
@@ -862,12 +949,16 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         try:
             await q.edit_message_text(
-                text, parse_mode=ParseMode.HTML, reply_markup=ticket_view_kb(t)
+                text, parse_mode=ParseMode.HTML, reply_markup=ticket_view_kb(t, uid)
             )
         except Exception as e:
             log.error(f"render ticket: {e}")
         return
+
     if data.startswith("close:"):
+        if not has_perm(uid, "close"):
+            await q.answer("Недостаточно прав", show_alert=True)
+            return
         tid = int(data.split(":")[1])
         t = get_ticket(tid)
         if not t:
@@ -876,18 +967,22 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, t = render_ticket(tid)
         try:
             await q.edit_message_text(
-                text, parse_mode=ParseMode.HTML, reply_markup=ticket_view_kb(t)
+                text, parse_mode=ParseMode.HTML, reply_markup=ticket_view_kb(t, uid)
             )
         except Exception:
             pass
         return
+
     if data.startswith("reopen:"):
+        if not has_perm(uid, "close"):
+            await q.answer("Недостаточно прав", show_alert=True)
+            return
         tid = int(data.split(":")[1])
         set_ticket_status(tid, "open")
         text, t = render_ticket(tid)
         try:
             await q.edit_message_text(
-                text, parse_mode=ParseMode.HTML, reply_markup=ticket_view_kb(t)
+                text, parse_mode=ParseMode.HTML, reply_markup=ticket_view_kb(t, uid)
             )
         except Exception:
             pass
@@ -938,7 +1033,6 @@ def main():
     app.add_handler(CommandHandler("unban", cmd_unban))
     app.add_handler(CommandHandler("banlist", cmd_banlist))
 
-    # rate: обрабатывается отдельно — это клик пользователя, не оператора
     app.add_handler(CallbackQueryHandler(user_cb_router, pattern=r"^rate:"))
     app.add_handler(CallbackQueryHandler(cb_router))
     app.add_handler(MessageHandler(
@@ -946,13 +1040,12 @@ def main():
         handle_private,
     ))
 
-    # Авто-закрытие каждые 30 минут, первый запуск через 60 сек
     if app.job_queue:
         app.job_queue.run_repeating(auto_close_job, interval=1800, first=60)
     else:
         log.warning("JobQueue недоступен — авто-закрытие отключено")
 
-    log.info(f"Бот запущен. Операторов: {len(OPERATOR_IDS)}")
+    log.info(f"Бот запущен. Операторов всего: {len(ALL_OPERATOR_IDS)}")
     app.run_polling()
 
 
