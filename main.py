@@ -46,7 +46,6 @@ OPERATOR_L3 = parse_ids(os.getenv("OPERATOR_L3", ""))
 OPERATOR_L2 = parse_ids(os.getenv("OPERATOR_L2", ""))
 OPERATOR_L1 = parse_ids(os.getenv("OPERATOR_L1", ""))
 
-# Обратная совместимость со старым OPERATOR_IDS
 _old_ops = parse_ids(os.getenv("OPERATOR_IDS", ""))
 if _old_ops and not (OPERATOR_L1 or OPERATOR_L2 or OPERATOR_L3):
     OPERATOR_L2 = _old_ops
@@ -56,12 +55,11 @@ ALL_OPERATOR_IDS = list(set(OWNER_IDS + OPERATOR_L3 + OPERATOR_L2 + OPERATOR_L1)
 if not ALL_OPERATOR_IDS:
     raise ValueError("Не задан ни один оператор/владелец (OWNER_IDS / OPERATOR_L1/L2/L3)")
 
-# Права по рангам
 ROLE_PERMS = {
-    "owner": {"reply", "view", "close", "stats", "ban", "banlist"},
-    "l3":    {"reply", "view", "close", "stats", "ban", "banlist"},
-    "l2":    {"reply", "view", "close", "stats"},
-    "l1":    {"reply", "view"},
+    "owner": {"reply", "view", "close", "stats", "ban", "banlist", "transfer"},
+    "l3":    {"reply", "view", "close", "stats", "ban", "banlist", "transfer"},
+    "l2":    {"reply", "view", "close", "stats", "transfer"},
+    "l1":    {"reply", "view", "transfer"},
 }
 
 ROLE_NAMES = {
@@ -69,6 +67,14 @@ ROLE_NAMES = {
     "l3": "Оператор 3 уровня",
     "l2": "Оператор 2 уровня",
     "l1": "Оператор 1 уровня",
+}
+
+# Чем выше число — тем выше ранг
+ROLE_RANK = {
+    "owner": 4,
+    "l3": 3,
+    "l2": 2,
+    "l1": 1,
 }
 
 
@@ -93,6 +99,22 @@ def has_perm(uid: int, perm: str) -> bool:
     if not role:
         return False
     return perm in ROLE_PERMS.get(role, set())
+
+
+def get_higher_operators(uid: int) -> list[int]:
+    """Возвращает ID операторов с более высоким рангом."""
+    my_role = get_role(uid)
+    if not my_role:
+        return []
+    my_rank = ROLE_RANK.get(my_role, 0)
+    higher = []
+    for op_id in ALL_OPERATOR_IDS:
+        if op_id == uid:
+            continue
+        r = get_role(op_id)
+        if r and ROLE_RANK.get(r, 0) > my_rank:
+            higher.append(op_id)
+    return higher
 
 
 logging.basicConfig(
@@ -426,6 +448,18 @@ def ticket_view_kb(t, uid: int):
             InlineKeyboardButton("Открыть", callback_data=f"reopen:{t['ticket_id']}")
         )
         buttons.append([btn])
+
+    # Кнопка «Передать выше» только для младших операторов и только на открытых тикетах
+    if t["status"] == "open" and has_perm(uid, "transfer"):
+        higher = get_higher_operators(uid)
+        if higher:
+            buttons.append([
+                InlineKeyboardButton(
+                    "⬆️ Передать выше",
+                    callback_data=f"transfer:{t['ticket_id']}"
+                )
+            ])
+
     buttons.append([InlineKeyboardButton("К списку", callback_data=f"list:{t['status']}:0")])
     return InlineKeyboardMarkup(buttons)
 
@@ -587,17 +621,24 @@ async def handle_operator_reply(update: Update, context: ContextTypes.DEFAULT_TY
             f"Тикет #{ticket_id} закрыт. Откройте: /open {ticket_id}"
         )
         return
+
     text = message.text or message.caption or "[медиа]"
     add_message(ticket_id, user.id, True, text)
+
+    # Подпись оператора: уровень + имя (не юзернейм)
+    role = get_role(user.id)
+    role_name = ROLE_NAMES.get(role, "Оператор")
+    op_name = esc(user.full_name or "Оператор")
+
     try:
         if message.text:
             await context.bot.send_message(
                 chat_id=target_uid,
-                text=f"<b>Оператор:</b>\n{esc(message.text)}",
+                text=f"<b>{role_name}</b> · {op_name}\n{esc(message.text)}",
                 parse_mode=ParseMode.HTML,
             )
         else:
-            caption = "<b>Оператор</b>"
+            caption = f"<b>{role_name}</b> · {op_name}"
             if message.caption:
                 caption += f"\n{esc(message.caption)}"
             await message.copy(
@@ -605,7 +646,9 @@ async def handle_operator_reply(update: Update, context: ContextTypes.DEFAULT_TY
                 caption=caption,
                 parse_mode=ParseMode.HTML,
             )
-        head = f"<b>Тикет #{ticket_id}</b> · ответ оператора"
+
+        # Уведомление другим операторам
+        head = f"<b>Тикет #{ticket_id}</b> · ответ: {role_name} · {op_name}"
         for op_id in ALL_OPERATOR_IDS:
             if op_id == user.id:
                 continue
@@ -992,6 +1035,76 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
+        return
+
+    # ---------- Передача тикета выше ----------
+    if data.startswith("transfer:"):
+        if not has_perm(uid, "transfer"):
+            await q.answer("Недостаточно прав", show_alert=True)
+            return
+
+        tid = int(data.split(":")[1])
+        t = get_ticket(tid)
+        if not t or t["status"] != "open":
+            await q.answer("Тикет не найден или уже закрыт", show_alert=True)
+            return
+
+        higher = get_higher_operators(uid)
+        if not higher:
+            await q.answer("Нет операторов выше вашего уровня", show_alert=True)
+            return
+
+        # Кто передаёт
+        from_role = get_role(uid)
+        from_role_name = ROLE_NAMES.get(from_role, "Оператор")
+        from_name = esc(update.effective_user.full_name or "Оператор")
+
+        # Информация о пользователе
+        conn = db()
+        urow = conn.execute(
+            "SELECT full_name, username FROM users WHERE user_id=?", (t["user_id"],)
+        ).fetchone()
+        conn.close()
+        user_name = esc(urow["full_name"] if urow else str(t["user_id"]))
+        user_uname = f"@{urow['username']}" if urow and urow["username"] else ""
+
+        transfer_text = (
+            f"⬆️ <b>Тикет #{tid} передан вам</b>\n"
+            f"От: {from_role_name} · {from_name}\n"
+            f"Пользователь: {user_name} · <code>{t['user_id']}</code> {user_uname}\n\n"
+            f"Откройте карточку, чтобы продолжить работу."
+        )
+
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Открыть карточку", callback_data=f"ticket:{tid}"),
+        ]])
+
+        sent_count = 0
+        for op_id in higher:
+            try:
+                await context.bot.send_message(
+                    chat_id=op_id,
+                    text=transfer_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb,
+                )
+                sent_count += 1
+            except Exception as e:
+                log.error(f"transfer notify {op_id}: {e}")
+
+        # Обновляем карточку у того, кто передал
+        text, t = render_ticket(tid)
+        try:
+            await q.edit_message_text(
+                text + f"\n\n⬆️ <i>Передан вышестоящим ({sent_count} чел.)</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=ticket_view_kb(t, uid),
+            )
+        except Exception:
+            pass
+
+        await q.answer(f"Тикет передан {sent_count} операторам выше", show_alert=False)
+        log.info(f"Transfer ticket #{tid} from {uid} to higher ops")
         return
 
 
