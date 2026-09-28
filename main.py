@@ -49,7 +49,7 @@ OPERATOR_L1 = parse_ids(os.getenv("OPERATOR_L1", ""))
 # Обратная совместимость со старым OPERATOR_IDS
 _old_ops = parse_ids(os.getenv("OPERATOR_IDS", ""))
 if _old_ops and not (OPERATOR_L1 or OPERATOR_L2 or OPERATOR_L3):
-    OPERATOR_L2 = _old_ops  # старые операторы = 2 уровень
+    OPERATOR_L2 = _old_ops
 
 ALL_OPERATOR_IDS = list(set(OWNER_IDS + OPERATOR_L3 + OPERATOR_L2 + OPERATOR_L1))
 
@@ -638,11 +638,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if has_perm(user.id, "stats"):
             lines.append("/stats — статистика")
         if has_perm(user.id, "close"):
-            lines.append("/close <id> — закрыть тикет")
-            lines.append("/open <id> — открыть тикет")
+            lines.append("/close &lt;id&gt; — закрыть тикет")
+            lines.append("/open &lt;id&gt; — открыть тикет")
         if has_perm(user.id, "ban"):
-            lines.append("/ban <id> [причина] — забанить")
-            lines.append("/unban <id> — разбанить")
+            lines.append("/ban &lt;id&gt; [причина] — забанить")
+            lines.append("/unban &lt;id&gt; — разбанить")
         if has_perm(user.id, "banlist"):
             lines.append("/banlist — список банов")
         lines.append("\nЧтобы ответить пользователю — свайпните на его сообщение.")
